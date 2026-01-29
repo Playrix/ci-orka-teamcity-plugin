@@ -90,6 +90,9 @@ public class OrkaCloudClient extends BuildServerAdapter implements CloudClientEx
   @Nullable
   private final CloudState cloudState;
 
+  // Reuse SecureRandom for VM name generation (thread-safe)
+  private static final SecureRandom SECURE_RANDOM = new SecureRandom();
+
   public OrkaCloudClient(@NotNull final CloudClientParameters params, ExecutorServices executorServices,
       @NotNull final String profileId, @NotNull final CloudState cloudState) {
     this.profileId = profileId;
@@ -853,10 +856,13 @@ public class OrkaCloudClient extends BuildServerAdapter implements CloudClientEx
       this.gracefulShutdownScheduledTask.cancel(false);
     }
 
+    // Create defensive copy to avoid ConcurrentModificationException
+    List<OrkaCloudImage> imagesCopy = new ArrayList<>(this.images);
+
     // Save running instances to LegacyInstancesStorage before clearing
     // These will be recovered by the new client as legacy instances
     List<PersistedInstanceData> instancesToSave = new ArrayList<>();
-    for (final OrkaCloudImage image : this.images) {
+    for (final OrkaCloudImage image : imagesCopy) {
       List<PersistedInstanceData> imageInstances = image.getInstancesForPersistence();
       instancesToSave.addAll(imageInstances);
     }
@@ -867,7 +873,7 @@ public class OrkaCloudClient extends BuildServerAdapter implements CloudClientEx
       LegacyInstancesStorage.getInstance().store(this.profileId, instancesToSave);
     }
 
-    for (final OrkaCloudImage image : this.images) {
+    for (final OrkaCloudImage image : imagesCopy) {
       image.dispose();
     }
     this.images.clear();
@@ -1226,10 +1232,9 @@ public class OrkaCloudClient extends BuildServerAdapter implements CloudClientEx
    */
   private String generateRandomSuffix(int length) {
     String chars = "abcdefghijklmnopqrstuvwxyz0123456789";
-    SecureRandom random = new SecureRandom();
     StringBuilder sb = new StringBuilder(length);
     for (int i = 0; i < length; i++) {
-      sb.append(chars.charAt(random.nextInt(chars.length())));
+      sb.append(chars.charAt(SECURE_RANDOM.nextInt(chars.length())));
     }
     return sb.toString();
   }

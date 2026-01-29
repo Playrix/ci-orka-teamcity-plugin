@@ -26,8 +26,8 @@ public class OrkaCloudInstance implements CloudInstance {
     @NotNull
     private final Date startDate;
     @NotNull
-    private String host;
-    private int sshPort;
+    private volatile String host;
+    private volatile int sshPort;
     @NotNull
     private volatile InstanceStatus status;
     @Nullable
@@ -67,7 +67,7 @@ public class OrkaCloudInstance implements CloudInstance {
         return this.id;
     }
 
-    public void setInstanceId(String id) {
+    public synchronized void setInstanceId(String id) {
         final String oldId = this.id;
         this.image.removeInstance(this.getInstanceId());
         this.id = id;
@@ -141,8 +141,16 @@ public class OrkaCloudInstance implements CloudInstance {
 
     public boolean containsAgent(@NotNull final AgentDescription agentDescription) {
         final Map<String, String> configParams = agentDescription.getConfigurationParameters();
+        if (configParams == null) {
+            return false;
+        }
         String agentInstanceId = configParams.get(OrkaConstants.INSTANCE_ID_PARAM_NAME);
         String agentImageId = configParams.get(OrkaConstants.IMAGE_ID_PARAM_NAME);
+
+        // Null-safe comparison: if agent params are null, no match
+        if (agentInstanceId == null || agentImageId == null) {
+            return false;
+        }
 
         boolean matches = this.id.equals(agentInstanceId) && getImageId().equals(agentImageId);
 

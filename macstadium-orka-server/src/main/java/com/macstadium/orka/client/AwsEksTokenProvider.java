@@ -147,6 +147,8 @@ public class AwsEksTokenProvider implements TokenProvider {
   public void invalidateToken() {
     LOG.info(String.format("Invalidating EKS token for cluster '%s' (cacheKey: %s)", clusterName, cacheKey));
     SHARED_TOKEN_CACHE.remove(cacheKey);
+    // Clean up lock object to prevent unbounded LOCK_MAP growth
+    LOCK_MAP.remove(cacheKey);
   }
 
   @Override

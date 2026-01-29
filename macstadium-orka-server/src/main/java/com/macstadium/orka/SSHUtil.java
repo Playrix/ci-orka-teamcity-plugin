@@ -3,6 +3,7 @@ package com.macstadium.orka;
 import com.intellij.openapi.diagnostic.Logger;
 
 import java.io.IOException;
+import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.util.concurrent.TimeUnit;
 
@@ -16,8 +17,12 @@ public class SSHUtil {
     LOG.debug(String.format("Waiting for SSH on %s:%d (max %d attempts, %ds interval)",
         host, sshPort, retries, secondsBetweenRetries));
 
+    // Socket connect timeout in milliseconds (10 seconds)
+    final int CONNECT_TIMEOUT_MS = 10_000;
+
     for (int attempt = 1; attempt <= retries; attempt++) {
-      try (Socket s = new Socket(host, sshPort)) {
+      try (Socket s = new Socket()) {
+        s.connect(new InetSocketAddress(host, sshPort), CONNECT_TIMEOUT_MS);
         LOG.info(String.format("SSH ready on %s:%d (attempt %d/%d)", host, sshPort, attempt, retries));
         return true;
       } catch (IOException ex) {

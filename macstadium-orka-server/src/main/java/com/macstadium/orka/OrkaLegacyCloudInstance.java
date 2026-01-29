@@ -69,16 +69,23 @@ public class OrkaLegacyCloudInstance extends OrkaCloudInstance {
      */
     @Override
     public boolean containsAgent(@NotNull AgentDescription agentDescription) {
-        Map<String, String> configParams = agentDescription.getConfigurationParameters();
-        String agentInstanceId = configParams.get(OrkaConstants.INSTANCE_ID_PARAM_NAME);
-        String agentImageId = configParams.get(OrkaConstants.IMAGE_ID_PARAM_NAME);
-
-        // First try standard matching
+        // First try standard matching (includes null checks)
         if (super.containsAgent(agentDescription)) {
             return true;
         }
 
         // For legacy instances, also try matching with original image ID
+        Map<String, String> configParams = agentDescription.getConfigurationParameters();
+        if (configParams == null) {
+            return false;
+        }
+        String agentInstanceId = configParams.get(OrkaConstants.INSTANCE_ID_PARAM_NAME);
+        String agentImageId = configParams.get(OrkaConstants.IMAGE_ID_PARAM_NAME);
+        if (agentInstanceId == null || agentImageId == null) {
+            return false;
+        }
+
+        // Match via original image ID (agent reports old imageId from before profile change)
         if (originalImageId != null && getInstanceId().equals(agentInstanceId)
                 && originalImageId.equals(agentImageId)) {
             LOG.debug(String.format("Legacy agent match: VM %s matched via originalImageId=%s",

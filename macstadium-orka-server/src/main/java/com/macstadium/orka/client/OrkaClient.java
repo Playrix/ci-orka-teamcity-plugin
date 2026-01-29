@@ -19,7 +19,11 @@ import okhttp3.Response;
 import okhttp3.ResponseBody;
 
 public class OrkaClient {
-  private static final OkHttpClient client = new OkHttpClient.Builder().readTimeout(15, TimeUnit.MINUTES).build();
+  private static final OkHttpClient client = new OkHttpClient.Builder()
+      .connectTimeout(30, TimeUnit.SECONDS)
+      .readTimeout(15, TimeUnit.MINUTES)
+      .writeTimeout(60, TimeUnit.SECONDS)
+      .build();
   private static final Logger LOG = Logger.getInstance(Loggers.CLOUD_CATEGORY_ROOT + OrkaConstants.TYPE);
 
   private static final String AUTHORIZATION_HEADER = "Authorization";
