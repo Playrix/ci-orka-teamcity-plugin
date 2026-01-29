@@ -58,6 +58,9 @@ public class OrkaCloudClient extends BuildServerAdapter implements CloudClientEx
   private static final long CAPACITY_CACHE_TTL_MS = 30_000; // 30 seconds
   private static final long CAPACITY_FAILURE_BACKOFF_MS = 30_000; // 30 seconds backoff after failure
 
+  // Agent connection timeout - if agent doesn't connect within this time, VM is marked for termination
+  private static final long AGENT_CONNECTION_TIMEOUT_MINUTES = 20;
+
   // Pattern to extract profile name from description: "profile 'NAME'{id=ID}"
   private static final Pattern PROFILE_NAME_PATTERN = Pattern.compile("profile\\s+'([^']+)'");
 
@@ -155,7 +158,9 @@ public class OrkaCloudClient extends BuildServerAdapter implements CloudClientEx
   private Map<String, String> getNodeMappings(String mappingsData) {
     if (StringUtil.isNotEmpty(mappingsData)) {
       String[] mappings = mappingsData.split("\\r?\\n|\\r");
-      return Arrays.stream(mappings).map(m -> m.split(";"))
+      return Arrays.stream(mappings)
+          .map(m -> m.split(";"))
+          .filter(pair -> pair.length >= 2 && !pair[0].isEmpty())
           .collect(Collectors.toMap(pair -> pair[0], pair -> pair[1]));
     }
     return new HashMap<String, String>();
@@ -572,7 +577,8 @@ public class OrkaCloudClient extends BuildServerAdapter implements CloudClientEx
           this.profileId, deployedInstanceId, image.getUser(), this.agentDirectory));
 
       // Update buildAgent.properties ONCE, then start agent ONCE
-      this.updateBuildAgentPropertiesOnce(host, sshPort, image.getUser(), image.getPassword(), deployedInstanceId);
+      this.updateBuildAgentPropertiesOnce(host, sshPort, image.getUser(), image.getPassword(),
+          deployedInstanceId, image.getNamespace());
 
       // Start agent without retry - if it fails, entire VM setup fails
       this.remoteAgent.startAgent(deployedInstanceId, image.getId(), host, sshPort, image.getUser(),
@@ -583,6 +589,9 @@ public class OrkaCloudClient extends BuildServerAdapter implements CloudClientEx
 
       // Register instance in CloudState for persistence across server restarts
       this.registerInstanceInCloudState(image.getId(), deployedInstanceId);
+
+      // Schedule check to verify agent connects to TeamCity
+      this.scheduleAgentConnectionCheck(instance);
     } catch (IOException | InterruptedException e) {
       LOG.warnAndDebugDetails(String.format("[%s] VM setup failed for %s",
           this.profileId, instance.getInstanceId()), e);
@@ -607,6 +616,58 @@ public class OrkaCloudClient extends BuildServerAdapter implements CloudClientEx
     }
   }
 
+  /**
+   * Schedules a check to verify agent connected to TeamCity.
+   * If agent hasn't connected within timeout, marks instance for termination.
+   * This prevents orphan VMs that exist in Orka but whose agents never register.
+   */
+  private void scheduleAgentConnectionCheck(OrkaCloudInstance instance) {
+    LOG.info(String.format("[%s] Scheduling agent connection check for VM %s in %d minutes",
+        this.profileId, instance.getInstanceId(), AGENT_CONNECTION_TIMEOUT_MINUTES));
+
+    this.scheduledExecutorService.schedule(() -> {
+      // Skip if instance is no longer tracked by its image
+      if (instance.getImage().findInstanceById(instance.getInstanceId()) == null) {
+        LOG.debug(String.format("[%s] Agent check skipped for %s: instance no longer tracked",
+            this.profileId, instance.getInstanceId()));
+        return;
+      }
+
+      // Skip if instance is no longer running
+      if (instance.getStatus() != InstanceStatus.RUNNING) {
+        LOG.debug(String.format("[%s] Agent check skipped for %s: status=%s",
+            this.profileId, instance.getInstanceId(), instance.getStatus()));
+        return;
+      }
+
+      // Skip if already marked for termination
+      if (instance.isMarkedForTermination()) {
+        LOG.debug(String.format("[%s] Agent check skipped for %s: already marked for termination",
+            this.profileId, instance.getInstanceId()));
+        return;
+      }
+
+      // Check if agent connected
+      if (instance.hasAgentConnected()) {
+        LOG.debug(String.format("[%s] Agent check passed for %s: agent connected",
+            this.profileId, instance.getInstanceId()));
+        return;
+      }
+
+      // Agent did not connect within timeout - mark for termination
+      LOG.warn(String.format("[%s] VM %s: agent did not connect within %d minutes, marking for termination",
+          this.profileId, instance.getInstanceId(), AGENT_CONNECTION_TIMEOUT_MINUTES));
+
+      instance.setStatus(InstanceStatus.ERROR);
+      instance.setErrorInfo(new CloudErrorInfo(
+          "Agent connection timeout",
+          String.format("TeamCity agent did not register within %d minutes. VM will be deleted.",
+              AGENT_CONNECTION_TIMEOUT_MINUTES)));
+      instance.setMarkedForTermination(true);
+
+    }, AGENT_CONNECTION_TIMEOUT_MINUTES, TimeUnit.MINUTES);
+  }
+
   private DeploymentResponse deployVM(String vmName, String vmConfig, String namespace, String vmMetadata)
       throws IOException {
     return this.orkaClient.deployVM(vmName, vmConfig, namespace, vmMetadata);
@@ -624,6 +685,42 @@ public class OrkaCloudClient extends BuildServerAdapter implements CloudClientEx
     return this.orkaClient.checkCapacity(vmConfigName, namespace);
   }
 
+  /**
+   * Gets the node name where a VM is running.
+   * Uses getVMs() API and filters by VM name.
+   */
+  private String getVmNodeName(String vmName, String namespace) {
+    try {
+      VMsResponse response = this.orkaClient.getVMs(namespace);
+      for (OrkaVM vm : response.getVMs()) {
+        if (vmName.equals(vm.getName())) {
+          LOG.debug(String.format("[%s] VM %s is on node: %s", this.profileId, vmName, vm.getNode()));
+          return vm.getNode();
+        }
+      }
+      LOG.warn(String.format("[%s] Could not find VM %s in namespace %s", this.profileId, vmName, namespace));
+    } catch (IOException e) {
+      LOG.warn(String.format("[%s] Failed to get node name for VM %s: %s", this.profileId, vmName, e.getMessage()));
+    }
+    return null;
+  }
+
+  /**
+   * Extracts location from node name.
+   * Node name format: "ns-h-tc-mac-98" or "dub-h-tc-mac-78"
+   * Returns first part before "-": "ns" or "dub"
+   */
+  private String extractLocationFromNodeName(String nodeName) {
+    if (StringUtil.isEmpty(nodeName)) {
+      return null;
+    }
+    String[] parts = nodeName.split("-");
+    if (parts.length > 0 && !parts[0].isEmpty()) {
+      return parts[0];
+    }
+    return null;
+  }
+
   private void waitForVM(String host, int sshPort) throws InterruptedException, IOException {
     int retries = 12;
     int secondsBetweenRetries = 10;
@@ -631,7 +728,7 @@ public class OrkaCloudClient extends BuildServerAdapter implements CloudClientEx
   }
 
   private void updateBuildAgentPropertiesOnce(String host, int sshPort, String sshUser, String sshPassword,
-      String instanceId) throws IOException {
+      String instanceId, String namespace) throws IOException {
     // Update buildAgent.properties if agentDirectory is configured
     // Always update agent name, update serverUrl only if configured
     if (this.agentDirectory == null || this.agentDirectory.trim().isEmpty()) {
@@ -639,7 +736,20 @@ public class OrkaCloudClient extends BuildServerAdapter implements CloudClientEx
     }
 
     String buildAgentPropertiesPath = String.format("%s/conf/buildAgent.properties", this.agentDirectory);
-    String agentName = "vm-mac-" + instanceId;
+
+    // Get location from node name via Orka API
+    String nodeName = this.getVmNodeName(instanceId, namespace);
+    String location = this.extractLocationFromNodeName(nodeName);
+
+    // Build agent name with location if available
+    String agentName;
+    if (StringUtil.isNotEmpty(location)) {
+      agentName = "vm-mac-" + location + "-" + instanceId;
+      LOG.info(String.format("[%s] Agent name with location: %s (node: %s)", this.profileId, agentName, nodeName));
+    } else {
+      agentName = "vm-mac-" + instanceId;
+      LOG.debug(String.format("[%s] Agent name without location: %s", this.profileId, agentName));
+    }
     boolean updateServerUrl = (this.serverUrl != null && !this.serverUrl.trim().isEmpty());
 
     try (net.schmizz.sshj.SSHClient ssh = new net.schmizz.sshj.SSHClient()) {
