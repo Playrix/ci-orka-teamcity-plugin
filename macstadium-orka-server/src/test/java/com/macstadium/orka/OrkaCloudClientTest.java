@@ -8,6 +8,8 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.timeout;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.macstadium.orka.client.CapacityInfo;
@@ -20,6 +22,8 @@ import com.macstadium.orka.client.VMResponse;
 import com.macstadium.orka.client.VMsResponse;
 
 import java.io.IOException;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -29,6 +33,7 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 
 import jetbrains.buildServer.clouds.CloudImage;
+import jetbrains.buildServer.clouds.CloudState;
 import jetbrains.buildServer.clouds.InstanceStatus;
 import jetbrains.buildServer.serverSide.AgentDescription;
 
@@ -614,6 +619,176 @@ public class OrkaCloudClientTest {
     when(mock.getConfigurationParameters()).thenReturn(params);
 
     return mock;
+  }
+
+  // ============ CloudState Recovery Tests ============
+
+  public void recoverFromCloudState_recoversInstancesFromCloudState() throws IOException {
+    String vmConfigName = "testVm";
+    String instanceId = "recovered-vm-123";
+    String vmHost = "192.168.1.100";
+    int vmSshPort = 8022;
+
+    OrkaClient orkaClient = mock(OrkaClient.class);
+    // Mock getVM to return VM details
+    VMResponse vmResponse = new VMResponse(instanceId, vmSshPort, vmHost, null);
+    vmResponse.setHttpResponse(new HttpResponse("success", 200, true));
+    when(orkaClient.getVM(instanceId, "orka-default")).thenReturn(vmResponse);
+
+    // Mock getVMs (used by recoverFromOrka)
+    VMsResponse vmsResponse = new VMsResponse(Collections.emptyList(), null);
+    vmsResponse.setHttpResponse(new HttpResponse("success", 200, true));
+    when(orkaClient.getVMs(any())).thenReturn(vmsResponse);
+
+    // Mock CloudState
+    CloudState cloudState = mock(CloudState.class);
+    String fullImageId = Utils.getFullImageId(vmConfigName);
+    when(cloudState.getStartedInstances(fullImageId)).thenReturn(Arrays.asList(instanceId));
+
+    OrkaCloudClient client = new OrkaCloudClient(
+        Utils.getCloudClientParametersMock(vmConfigName),
+        orkaClient, getScheduledExecutorService(),
+        mock(RemoteAgent.class), mock(SSHUtil.class),
+        "test-profile", "Test Profile", cloudState);
+
+    // The instance should be recovered from CloudState
+    OrkaCloudImage image = client.findImageById(fullImageId);
+    assertNotNull("Image should be found", image);
+
+    OrkaCloudInstance instance = image.findInstanceById(instanceId);
+    assertNotNull("Instance should be recovered from CloudState", instance);
+    assertEquals(vmHost, instance.getHost());
+    assertEquals(vmSshPort, instance.getPort());
+    assertEquals(InstanceStatus.RUNNING, instance.getStatus());
+  }
+
+  public void recoverFromCloudState_skipsNonExistentVMs() throws IOException {
+    String vmConfigName = "testVm";
+    String instanceId = "non-existent-vm";
+
+    OrkaClient orkaClient = mock(OrkaClient.class);
+    // Mock getVM to return 404 (VM not found)
+    VMResponse vmResponse = new VMResponse(null, 0, null, "VM not found");
+    vmResponse.setHttpResponse(new HttpResponse("not found", 404, false));
+    when(orkaClient.getVM(instanceId, "orka-default")).thenReturn(vmResponse);
+
+    // Mock getVMs (used by recoverFromOrka)
+    VMsResponse vmsResponse = new VMsResponse(Collections.emptyList(), null);
+    vmsResponse.setHttpResponse(new HttpResponse("success", 200, true));
+    when(orkaClient.getVMs(any())).thenReturn(vmsResponse);
+
+    // Mock CloudState
+    CloudState cloudState = mock(CloudState.class);
+    String fullImageId = Utils.getFullImageId(vmConfigName);
+    when(cloudState.getStartedInstances(fullImageId)).thenReturn(Arrays.asList(instanceId));
+
+    OrkaCloudClient client = new OrkaCloudClient(
+        Utils.getCloudClientParametersMock(vmConfigName),
+        orkaClient, getScheduledExecutorService(),
+        mock(RemoteAgent.class), mock(SSHUtil.class),
+        "test-profile", "Test Profile", cloudState);
+
+    // The instance should NOT be recovered (VM doesn't exist in Orka)
+    OrkaCloudImage image = client.findImageById(fullImageId);
+    assertNotNull("Image should be found", image);
+
+    OrkaCloudInstance instance = image.findInstanceById(instanceId);
+    assertNull("Instance should NOT be recovered when VM doesn't exist in Orka", instance);
+  }
+
+  public void recoverFromCloudState_handlesEmptyCloudState() throws IOException {
+    String vmConfigName = "testVm";
+
+    OrkaClient orkaClient = mock(OrkaClient.class);
+
+    // Mock getVMs (used by recoverFromOrka)
+    VMsResponse vmsResponse = new VMsResponse(Collections.emptyList(), null);
+    vmsResponse.setHttpResponse(new HttpResponse("success", 200, true));
+    when(orkaClient.getVMs(any())).thenReturn(vmsResponse);
+
+    // Mock CloudState with empty instances
+    CloudState cloudState = mock(CloudState.class);
+    String fullImageId = Utils.getFullImageId(vmConfigName);
+    when(cloudState.getStartedInstances(fullImageId)).thenReturn(Collections.emptyList());
+
+    OrkaCloudClient client = new OrkaCloudClient(
+        Utils.getCloudClientParametersMock(vmConfigName),
+        orkaClient, getScheduledExecutorService(),
+        mock(RemoteAgent.class), mock(SSHUtil.class),
+        "test-profile", "Test Profile", cloudState);
+
+    // Should not fail, just have no instances
+    OrkaCloudImage image = client.findImageById(fullImageId);
+    assertNotNull("Image should be found", image);
+    assertTrue("Image should have no instances", image.getInstances().isEmpty());
+  }
+
+  public void recoverFromCloudState_handlesNullCloudState() throws IOException {
+    String vmConfigName = "testVm";
+
+    OrkaClient orkaClient = mock(OrkaClient.class);
+
+    // Mock getVMs (used by recoverFromOrka)
+    VMsResponse vmsResponse = new VMsResponse(Collections.emptyList(), null);
+    vmsResponse.setHttpResponse(new HttpResponse("success", 200, true));
+    when(orkaClient.getVMs(any())).thenReturn(vmsResponse);
+
+    // Pass null CloudState
+    OrkaCloudClient client = new OrkaCloudClient(
+        Utils.getCloudClientParametersMock(vmConfigName),
+        orkaClient, getScheduledExecutorService(),
+        mock(RemoteAgent.class), mock(SSHUtil.class),
+        "test-profile", "Test Profile", null);
+
+    // Should not fail
+    OrkaCloudImage image = client.findImageById(Utils.getFullImageId(vmConfigName));
+    assertNotNull("Image should be found", image);
+  }
+
+  public void terminateInstance_unregistersFromCloudState() throws IOException {
+    String vmConfigName = "testVm";
+    String instanceId = "vm-to-terminate";
+    String vmHost = "192.168.1.100";
+    int vmSshPort = 8022;
+
+    OrkaClient orkaClient = mock(OrkaClient.class);
+    // Mock getVM for recovery
+    VMResponse vmResponse = new VMResponse(instanceId, vmSshPort, vmHost, null);
+    vmResponse.setHttpResponse(new HttpResponse("success", 200, true));
+    when(orkaClient.getVM(instanceId, "orka-default")).thenReturn(vmResponse);
+
+    // Mock getVMs (used by recoverFromOrka)
+    VMsResponse vmsResponse = new VMsResponse(Collections.emptyList(), null);
+    vmsResponse.setHttpResponse(new HttpResponse("success", 200, true));
+    when(orkaClient.getVMs(any())).thenReturn(vmsResponse);
+
+    // Mock deleteVM to succeed
+    DeletionResponse deletionResponse = new DeletionResponse("Success");
+    deletionResponse.setHttpResponse(new HttpResponse("success", 200, true));
+    when(orkaClient.deleteVM(instanceId, "orka-default")).thenReturn(deletionResponse);
+
+    // Mock CloudState
+    CloudState cloudState = mock(CloudState.class);
+    String fullImageId = Utils.getFullImageId(vmConfigName);
+    when(cloudState.getStartedInstances(fullImageId)).thenReturn(Arrays.asList(instanceId));
+
+    OrkaCloudClient client = new OrkaCloudClient(
+        Utils.getCloudClientParametersMock(vmConfigName),
+        orkaClient, getScheduledExecutorService(),
+        mock(RemoteAgent.class), mock(SSHUtil.class),
+        "test-profile", "Test Profile", cloudState);
+
+    // Get the recovered instance
+    OrkaCloudImage image = client.findImageById(fullImageId);
+    assertNotNull("Image should be found", image);
+    OrkaCloudInstance instance = image.findInstanceById(instanceId);
+    assertNotNull("Instance should be recovered", instance);
+
+    // Terminate the instance
+    client.terminateInstance(instance);
+
+    // Verify registerTerminatedInstance was called (with timeout for async execution)
+    verify(cloudState, timeout(1000)).registerTerminatedInstance(fullImageId, instanceId);
   }
 
     private OrkaClient getOrkaClientMock(String host, int sshPort, String instanceId) throws IOException {

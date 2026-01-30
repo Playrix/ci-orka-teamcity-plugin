@@ -156,6 +156,11 @@ public class OrkaCloudClient extends BuildServerAdapter implements CloudClientEx
     this.remoteAgent = remoteAgent;
     this.sshUtil = sshUtil;
     this.nodeMappings = this.getNodeMappings(params.getParameter(OrkaConstants.NODE_MAPPINGS));
+
+    // Trigger instance recovery (same as production constructor)
+    if (this.scheduledExecutorService != null) {
+      this.scheduledExecutorService.submit(this::recoverExistingInstances);
+    }
   }
 
   private Map<String, String> getNodeMappings(String mappingsData) {
@@ -818,7 +823,10 @@ public class OrkaCloudClient extends BuildServerAdapter implements CloudClientEx
           // Clear capacity backoff since resources are now freed
           this.clearCapacityBackoff();
 
-          // 3. Remove instance from tracking (TeamCity will remove agent from UI)
+          // 3. Unregister from CloudState (removes from TeamCity database)
+          this.unregisterInstanceFromCloudState(image.getId(), instance.getInstanceId());
+
+          // 4. Remove instance from tracking (TeamCity will remove agent from UI)
           orkaInstance.setStatus(InstanceStatus.STOPPED);
           image.terminateInstance(instance.getInstanceId());
           LOG.info(String.format("[%s] Instance %s terminated", this.profileId, instance.getInstanceId()));
@@ -934,11 +942,32 @@ public class OrkaCloudClient extends BuildServerAdapter implements CloudClientEx
   }
 
   /**
+   * Unregisters instance from CloudState after termination.
+   * This removes the instance from TeamCity database so it won't be recovered on restart.
+   */
+  private void unregisterInstanceFromCloudState(@NotNull String imageId, @NotNull String instanceId) {
+    if (this.cloudState == null) {
+      return;
+    }
+
+    try {
+      this.cloudState.registerTerminatedInstance(imageId, instanceId);
+      LOG.debug(String.format("[%s] Unregistered instance %s from CloudState (imageId=%s)",
+          this.profileId, instanceId, imageId));
+    } catch (Exception e) {
+      // Don't fail termination if CloudState unregistration fails
+      LOG.warn(String.format("[%s] Failed to unregister instance %s from CloudState: %s",
+          this.profileId, instanceId, e.getMessage()));
+    }
+  }
+
+  /**
    * Recovers existing VMs from multiple sources:
-   * 1. LegacyInstancesStorage - instances from previous profile config (profile
+   * 1. CloudState - instances persisted in TeamCity database (server restart)
+   * 2. LegacyInstancesStorage - instances from previous profile config (profile
    * reload)
-   * 2. Orka API - instances with matching tc_profile_id metadata (server restart)
-   * 
+   * 3. Orka API - instances with matching tc_profile_id metadata (fallback)
+   *
    * Called at startup to restore state after profile reload or server restart.
    */
   private void recoverExistingInstances() {
@@ -948,12 +977,84 @@ public class OrkaCloudClient extends BuildServerAdapter implements CloudClientEx
 
     OrkaCloudImage image = this.images.get(0);
 
-    // 1. First, recover legacy instances from LegacyInstancesStorage (profile
+    // 1. First, recover from CloudState (TeamCity database - server restart)
+    recoverFromCloudState(image);
+
+    // 2. Then recover legacy instances from LegacyInstancesStorage (profile
     // reload)
     recoverLegacyInstances(image);
 
-    // 2. Then recover instances from Orka API using metadata (server restart)
+    // 3. Finally, recover instances from Orka API using metadata (fallback)
     recoverFromOrka(image);
+  }
+
+  /**
+   * Recovers instances from TeamCity CloudState database.
+   * CloudState stores instanceIds that were registered during VM creation.
+   * For each instanceId, we verify the VM still exists in Orka and restore it.
+   */
+  private void recoverFromCloudState(OrkaCloudImage image) {
+    if (this.cloudState == null) {
+      LOG.debug(String.format("[%s] CloudState not available, skipping CloudState recovery", this.profileId));
+      return;
+    }
+
+    if (this.orkaClient == null) {
+      LOG.debug(String.format("[%s] OrkaClient not available, skipping CloudState recovery", this.profileId));
+      return;
+    }
+
+    try {
+      Collection<String> instanceIds = this.cloudState.getStartedInstances(image.getId());
+      if (instanceIds == null || instanceIds.isEmpty()) {
+        LOG.debug(String.format("[%s] No instances found in CloudState for imageId=%s",
+            this.profileId, image.getId()));
+        return;
+      }
+
+      LOG.info(String.format("[%s] Found %d instance(s) in CloudState to recover",
+          this.profileId, instanceIds.size()));
+
+      int recoveredCount = 0;
+      for (String instanceId : instanceIds) {
+        try {
+          // Check if instance already exists
+          if (image.findInstanceById(instanceId) != null) {
+            LOG.debug(String.format("[%s] Instance %s already exists, skipping",
+                this.profileId, instanceId));
+            continue;
+          }
+
+          // Verify VM exists in Orka and get its details
+          VMResponse vmResponse = this.getVM(instanceId, image.getNamespace());
+          if (!vmResponse.isSuccessful() || vmResponse.getIP() == null) {
+            LOG.debug(String.format("[%s] VM %s not found in Orka, skipping",
+                this.profileId, instanceId));
+            continue;
+          }
+
+          // Recover instance
+          OrkaCloudInstance instance = image.startNewInstance(instanceId);
+          instance.setStatus(InstanceStatus.RUNNING);
+          instance.setHost(this.getRealHost(vmResponse.getIP()));
+          instance.setPort(vmResponse.getSSH() > 0 ? vmResponse.getSSH() : 22);
+
+          LOG.info(String.format("[%s] Recovered VM from CloudState: %s (IP: %s, SSH: %d)",
+              this.profileId, instanceId, vmResponse.getIP(), instance.getPort()));
+          recoveredCount++;
+        } catch (IOException e) {
+          LOG.warn(String.format("[%s] Failed to verify VM %s: %s",
+              this.profileId, instanceId, e.getMessage()));
+        }
+      }
+
+      if (recoveredCount > 0) {
+        LOG.info(String.format("[%s] Recovered %d VM(s) from CloudState", this.profileId, recoveredCount));
+      }
+    } catch (Exception e) {
+      LOG.warn(String.format("[%s] Failed to recover instances from CloudState: %s",
+          this.profileId, e.getMessage()));
+    }
   }
 
   /**
