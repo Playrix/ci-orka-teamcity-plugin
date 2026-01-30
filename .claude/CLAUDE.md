@@ -41,7 +41,7 @@ export JAVA_HOME=/Library/Java/JavaVirtualMachines/temurin-21.jdk/Contents/Home
 # Full build with tests
 ./gradlew clean build
 
-# Run tests only (86 tests)
+# Run tests only (95 tests)
 ./gradlew test
 
 # Compile without tests
@@ -110,9 +110,17 @@ export JAVA_HOME=/Library/Java/JavaVirtualMachines/temurin-21.jdk/Contents/Home
 - Backoff mechanism after failed checks
 
 ### Instance Recovery
-- `LegacyInstancesStorage` - preserves instances during profile reload
-- `CloudState` - storage in TeamCity database
-- Orka API metadata - `tc_profile_id` and `tc_image_id` tags
+Recovery order (in `recoverExistingInstances()`):
+1. **CloudState** - TeamCity database (server restart)
+2. **LegacyInstancesStorage** - in-memory (profile reload)
+3. **Orka API metadata** - `tc_profile_id` tag (fallback)
+
+**CloudState API:**
+```java
+cloudState.registerRunningInstance(imageId, instanceId);    // On VM creation
+cloudState.registerTerminatedInstance(imageId, instanceId); // On VM termination
+cloudState.getStartedInstances(imageId);                    // For recovery
+```
 
 ### SSH Management
 - SSH availability wait: 12 retries (120 seconds)
@@ -251,7 +259,7 @@ When modifying these areas, ensure thorough testing:
 3. **Run validation before committing:**
    ```bash
    ./gradlew compileJava   # Verify compilation
-   ./gradlew test          # Run all tests (86 tests)
+   ./gradlew test          # Run all tests (95 tests)
    ./gradlew check         # Checkstyle validation
    ```
 
@@ -306,6 +314,14 @@ When modifying these areas, ensure thorough testing:
 - [ ] Resource cleanup (close streams, delete temp files in `finally` blocks)
 - [ ] Exception handling (don't swallow exceptions silently)
 
+**Common code review issues:**
+
+| Проблема | Плохо | Хорошо |
+|----------|-------|--------|
+| Broad exception | `catch (Exception e)` | `catch (IOException e)` |
+| Missing stack trace | `LOG.warn("Error: " + e.getMessage())` | `LOG.warn("Error", e)` |
+| Flaky async test | `Thread.sleep(100); verify(mock)` | `verify(mock, timeout(1000))` |
+
 **Using Claude for code review:**
 - Review unstaged changes: "Review my changes"
 - Review specific file: "Review OrkaCloudClient.java"
@@ -354,6 +370,17 @@ For resources shared across multiple instances (e.g., tokens):
 2. Use composite cache key (e.g., `cluster:region`)
 3. Synchronize only the refresh operation, not reads
 4. Provide `invalidate()` method for cache clearing
+
+### Async Testing Pattern
+For testing asynchronous operations:
+```java
+// BAD - flaky, slow
+Thread.sleep(100);
+verify(mock).someMethod();
+
+// GOOD - waits up to 1 second, returns immediately when called
+verify(mock, timeout(1000)).someMethod();
+```
 
 ## Version History
 
