@@ -1137,6 +1137,7 @@ public class OrkaCloudClient extends BuildServerAdapter implements CloudClientEx
         instance.setStatus(InstanceStatus.RUNNING);
         instance.setHost(this.getRealHost(vm.getIp()));
         instance.setPort(vm.getSsh() > 0 ? vm.getSsh() : 22);
+        instance.markAgentConnected();  // Mark as connected to prevent timeout termination
 
         // Register in CloudState for TeamCity tracking
         this.registerInstanceInCloudState(image.getId(), vm.getName());
@@ -1227,6 +1228,7 @@ public class OrkaCloudClient extends BuildServerAdapter implements CloudClientEx
           instance.setHost(this.getRealHost(data.getHost()));
         }
         instance.setPort(data.getPort());
+        instance.markAgentConnected();  // Mark as connected to prevent timeout termination
 
         this.registerInstanceInCloudState(image.getId(), data.getInstanceId());
 
