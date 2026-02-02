@@ -1,6 +1,7 @@
 package com.macstadium.orka;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
@@ -80,12 +81,17 @@ public class OrkaCloudClientTest {
 
     OrkaCloudImage image = client.findImageById(fullImageId);
     assertNotNull("Image should be found", image);
-    image.startNewInstance(instanceId);
+    OrkaCloudInstance createdInstance = image.startNewInstance(instanceId);
+
+    // Verify agent is NOT connected initially
+    assertFalse("Agent should not be marked as connected initially", createdInstance.hasAgentConnected());
 
     AgentDescription agentDescription = this.getAgentDescriptionMock(instanceId, fullImageId);
 
     OrkaCloudInstance instance = client.findInstanceByAgent(agentDescription);
     assertNotNull(instance);
+    // Verify agent IS marked as connected after findInstanceByAgent
+    assertTrue("findInstanceByAgent should mark agent as connected", instance.hasAgentConnected());
   }
 
   public void when_find_instance_by_agent_with_wrong_image_id_should_return_null() throws IOException {
@@ -134,6 +140,8 @@ public class OrkaCloudClientTest {
     assertNotNull(instance);
     assertEquals(instanceId, instance.getInstanceId());
     assertEquals(fullImageId, instance.getImageId());
+    // Verify agent IS marked as connected for recovered instance from Orka
+    assertTrue("Recovered instance from Orka should have agent marked as connected", instance.hasAgentConnected());
   }
 
   public void when_start_new_instance_should_return_new_instance() throws IOException, InterruptedException {
@@ -621,6 +629,42 @@ public class OrkaCloudClientTest {
     return mock;
   }
 
+  /**
+   * Test that when agent timeout is disabled via property, no scheduling happens.
+   * Property: teamcity.cloud.orka.agentConnectionTimeout.enabled=false
+   */
+  public void when_agent_timeout_disabled_via_property_should_not_schedule_check() throws IOException {
+    String vmConfigName = "imageId";
+    String privateHost = "10.10.10.4";
+    String propertyName = "teamcity.cloud.orka.agentConnectionTimeout.enabled";
+
+    // Disable agent timeout via system property (TeamCityProperties reads from system properties)
+    System.setProperty(propertyName, "false");
+
+    try {
+      OrkaClient orkaClient = this.getOrkaClientMock(privateHost, 22, "instanceId");
+      ScheduledExecutorService scheduledExecutor = mock(ScheduledExecutorService.class);
+
+      when(scheduledExecutor.submit(any(Runnable.class))).thenAnswer(invocation -> {
+        Runnable r = (Runnable) invocation.getArguments()[0];
+        r.run();
+        return CompletableFuture.completedFuture(null);
+      });
+
+      OrkaCloudClient client = new OrkaCloudClient(Utils.getCloudClientParametersMock(vmConfigName),
+          orkaClient, scheduledExecutor, mock(RemoteAgent.class), mock(SSHUtil.class));
+
+      client.startNewInstance(this.getImage(client), null);
+
+      // Verify schedule() was NEVER called (timeout check was skipped)
+      verify(scheduledExecutor, org.mockito.Mockito.never())
+          .schedule(any(Runnable.class), any(Long.class), any(TimeUnit.class));
+    } finally {
+      // Clean up system property
+      System.clearProperty(propertyName);
+    }
+  }
+
   // ============ CloudState Recovery Tests ============
 
   public void recoverFromCloudState_recoversInstancesFromCloudState() throws IOException {
@@ -660,6 +704,9 @@ public class OrkaCloudClientTest {
     assertEquals(vmHost, instance.getHost());
     assertEquals(vmSshPort, instance.getPort());
     assertEquals(InstanceStatus.RUNNING, instance.getStatus());
+    // Verify agent IS marked as connected for recovered instance from CloudState
+    assertTrue("Recovered instance from CloudState should have agent marked as connected",
+        instance.hasAgentConnected());
   }
 
   public void recoverFromCloudState_skipsNonExistentVMs() throws IOException {
@@ -789,6 +836,63 @@ public class OrkaCloudClientTest {
 
     // Verify registerTerminatedInstance was called (with timeout for async execution)
     verify(cloudState, timeout(1000)).registerTerminatedInstance(fullImageId, instanceId);
+  }
+
+  /**
+   * Test that when client is disposed (profile reload), scheduled timeout check is skipped.
+   * This tests the fix for a race condition where:
+   * 1. VM is started, timeout check is scheduled
+   * 2. Profile reload happens, dispose() clears images
+   * 3. setInstanceId() adds instance back to disposed image (race condition)
+   * 4. Timeout fires and incorrectly marks instance for termination
+   *
+   * The fix uses this.findImageById() instead of instance.getImage() to check
+   * against current client state, not the captured instance reference.
+   */
+  public void when_client_disposed_before_timeout_should_skip_check() throws IOException {
+    String vmConfigName = "imageId";
+    String privateHost = "10.10.10.4";
+    String instanceId = "instanceId";
+
+    OrkaClient orkaClient = this.getOrkaClientMock(privateHost, 22, instanceId);
+
+    // Capture the scheduled Runnable
+    final Runnable[] capturedRunnable = new Runnable[1];
+    ScheduledExecutorService scheduledExecutor = mock(ScheduledExecutorService.class);
+    when(scheduledExecutor.submit(any(Runnable.class))).thenAnswer(invocation -> {
+      Runnable r = (Runnable) invocation.getArguments()[0];
+      r.run();
+      return CompletableFuture.completedFuture(null);
+    });
+    when(scheduledExecutor.schedule(any(Runnable.class), any(Long.class), any(TimeUnit.class)))
+        .thenAnswer(invocation -> {
+          capturedRunnable[0] = (Runnable) invocation.getArguments()[0];
+          return mock(ScheduledFuture.class);
+        });
+
+    OrkaCloudClient client = new OrkaCloudClient(Utils.getCloudClientParametersMock(vmConfigName),
+        orkaClient, scheduledExecutor, mock(RemoteAgent.class), mock(SSHUtil.class));
+
+    OrkaCloudInstance instance = (OrkaCloudInstance) client.startNewInstance(this.getImage(client), null);
+    assertNotNull(instance);
+    assertEquals(InstanceStatus.RUNNING, instance.getStatus());
+
+    // Simulate profile reload: dispose the client
+    client.dispose();
+
+    // Verify images are cleared
+    assertTrue("Images should be cleared after dispose", client.getImages().isEmpty());
+
+    // Run the timeout check - should be skipped because client is disposed
+    assertNotNull("Scheduled runnable should be captured", capturedRunnable[0]);
+    capturedRunnable[0].run();
+
+    // Instance should NOT be marked for termination because check should be skipped
+    // (The check uses this.findImageById() which returns null after dispose)
+    assertFalse("Instance should NOT be marked for termination after dispose",
+        instance.isMarkedForTermination());
+    // Status should remain RUNNING (not ERROR)
+    assertEquals("Instance status should remain RUNNING", InstanceStatus.RUNNING, instance.getStatus());
   }
 
     private OrkaClient getOrkaClientMock(String host, int sshPort, String instanceId) throws IOException {

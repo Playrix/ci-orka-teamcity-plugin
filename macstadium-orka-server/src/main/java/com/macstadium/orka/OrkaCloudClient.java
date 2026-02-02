@@ -46,6 +46,7 @@ import jetbrains.buildServer.clouds.QuotaException;
 import jetbrains.buildServer.log.Loggers;
 import jetbrains.buildServer.serverSide.AgentDescription;
 import jetbrains.buildServer.serverSide.BuildServerAdapter;
+import jetbrains.buildServer.serverSide.TeamCityProperties;
 import jetbrains.buildServer.serverSide.executors.ExecutorServices;
 
 import org.jetbrains.annotations.NotNull;
@@ -60,6 +61,10 @@ public class OrkaCloudClient extends BuildServerAdapter implements CloudClientEx
 
   // Agent connection timeout - if agent doesn't connect within this time, VM is marked for termination
   private static final long AGENT_CONNECTION_TIMEOUT_MINUTES = 20;
+
+  // Property to enable/disable agent connection timeout check (default: enabled)
+  // Set teamcity.cloud.orka.agentConnectionTimeout.enabled=false in internal.properties to disable
+  private static final String AGENT_TIMEOUT_ENABLED_PROPERTY = "teamcity.cloud.orka.agentConnectionTimeout.enabled";
 
   // Pattern to extract profile name from description: "profile 'NAME'{id=ID}"
   private static final Pattern PROFILE_NAME_PATTERN = Pattern.compile("profile\\s+'([^']+)'");
@@ -285,6 +290,8 @@ public class OrkaCloudClient extends BuildServerAdapter implements CloudClientEx
     if (image != null) {
       OrkaCloudInstance existingInstance = image.findInstanceById(instanceId);
       if (existingInstance != null) {
+        // Mark agent as connected when TeamCity finds the instance
+        existingInstance.markAgentConnected();
         return existingInstance;
       }
     }
@@ -339,6 +346,8 @@ public class OrkaCloudClient extends BuildServerAdapter implements CloudClientEx
         cloudInstance.setStatus(InstanceStatus.RUNNING);
         cloudInstance.setHost(this.getRealHost(vmResponse.getIP()));
         cloudInstance.setPort(sshPort);
+        // Mark agent as connected - this is a recovery from existing agent
+        cloudInstance.markAgentConnected();
         return cloudInstance;
       }
     } catch (IOException | NumberFormatException e) {
@@ -630,49 +639,79 @@ public class OrkaCloudClient extends BuildServerAdapter implements CloudClientEx
    * This prevents orphan VMs that exist in Orka but whose agents never register.
    */
   private void scheduleAgentConnectionCheck(OrkaCloudInstance instance) {
+    // Check if agent timeout is enabled via internal.properties
+    // Default is true (enabled). Set teamcity.cloud.orka.agentConnectionTimeout.enabled=false to disable
+    if (!TeamCityProperties.getBooleanOrTrue(AGENT_TIMEOUT_ENABLED_PROPERTY)) {
+      LOG.info(String.format("[%s] Agent connection timeout check is disabled via %s property",
+          this.profileId, AGENT_TIMEOUT_ENABLED_PROPERTY));
+      return;
+    }
+
     LOG.info(String.format("[%s] Scheduling agent connection check for VM %s in %d minutes",
         this.profileId, instance.getInstanceId(), AGENT_CONNECTION_TIMEOUT_MINUTES));
 
+    // Capture instance ID and image ID at scheduling time
+    // We'll look up the CURRENT instance object when the task runs
+    final String instanceId = instance.getInstanceId();
+    final String imageId = instance.getImageId();
+
     this.scheduledExecutorService.schedule(() -> {
-      // Skip if instance is no longer tracked by its image
-      if (instance.getImage().findInstanceById(instance.getInstanceId()) == null) {
-        LOG.debug(String.format("[%s] Agent check skipped for %s: instance no longer tracked",
-            this.profileId, instance.getInstanceId()));
-        return;
+      try {
+        // Look up instance from CURRENT client's images, not the captured reference
+        // This prevents race condition when profile reload happens:
+        // - Old client's dispose() clears images, but setInstanceId() may add instance back
+        // - Using captured instance.getImage() would find it in the disposed image
+        // - Using this.findImageById() returns null after dispose (images cleared)
+        OrkaCloudImage currentImage = this.findImageById(imageId);
+        if (currentImage == null) {
+          LOG.debug(String.format("[%s] Agent check skipped for %s: image no longer exists (client disposed?)",
+              this.profileId, instanceId));
+          return;
+        }
+
+        OrkaCloudInstance currentInstance = currentImage.findInstanceById(instanceId);
+        if (currentInstance == null) {
+          LOG.debug(String.format("[%s] Agent check skipped for %s: instance no longer tracked",
+              this.profileId, instanceId));
+          return;
+        }
+
+        // Skip if instance is no longer running
+        if (currentInstance.getStatus() != InstanceStatus.RUNNING) {
+          LOG.debug(String.format("[%s] Agent check skipped for %s: status=%s",
+              this.profileId, instanceId, currentInstance.getStatus()));
+          return;
+        }
+
+        // Skip if already marked for termination
+        if (currentInstance.isMarkedForTermination()) {
+          LOG.debug(String.format("[%s] Agent check skipped for %s: already marked for termination",
+              this.profileId, instanceId));
+          return;
+        }
+
+        // Check if agent connected
+        if (currentInstance.hasAgentConnected()) {
+          LOG.debug(String.format("[%s] Agent check passed for %s: agent connected",
+              this.profileId, instanceId));
+          return;
+        }
+
+        // Agent did not connect within timeout - mark for termination
+        LOG.warn(String.format("[%s] VM %s: agent did not connect within %d minutes, marking for termination",
+            this.profileId, instanceId, AGENT_CONNECTION_TIMEOUT_MINUTES));
+
+        currentInstance.setStatus(InstanceStatus.ERROR);
+        currentInstance.setErrorInfo(new CloudErrorInfo(
+            "Agent connection timeout",
+            String.format("TeamCity agent did not register within %d minutes. VM will be deleted.",
+                AGENT_CONNECTION_TIMEOUT_MINUTES)));
+        currentInstance.setMarkedForTermination(true);
+
+      } catch (Exception e) {
+        LOG.warn(String.format("[%s] Agent connection check failed for %s: %s",
+            this.profileId, instanceId, e.getMessage()), e);
       }
-
-      // Skip if instance is no longer running
-      if (instance.getStatus() != InstanceStatus.RUNNING) {
-        LOG.debug(String.format("[%s] Agent check skipped for %s: status=%s",
-            this.profileId, instance.getInstanceId(), instance.getStatus()));
-        return;
-      }
-
-      // Skip if already marked for termination
-      if (instance.isMarkedForTermination()) {
-        LOG.debug(String.format("[%s] Agent check skipped for %s: already marked for termination",
-            this.profileId, instance.getInstanceId()));
-        return;
-      }
-
-      // Check if agent connected
-      if (instance.hasAgentConnected()) {
-        LOG.debug(String.format("[%s] Agent check passed for %s: agent connected",
-            this.profileId, instance.getInstanceId()));
-        return;
-      }
-
-      // Agent did not connect within timeout - mark for termination
-      LOG.warn(String.format("[%s] VM %s: agent did not connect within %d minutes, marking for termination",
-          this.profileId, instance.getInstanceId(), AGENT_CONNECTION_TIMEOUT_MINUTES));
-
-      instance.setStatus(InstanceStatus.ERROR);
-      instance.setErrorInfo(new CloudErrorInfo(
-          "Agent connection timeout",
-          String.format("TeamCity agent did not register within %d minutes. VM will be deleted.",
-              AGENT_CONNECTION_TIMEOUT_MINUTES)));
-      instance.setMarkedForTermination(true);
-
     }, AGENT_CONNECTION_TIMEOUT_MINUTES, TimeUnit.MINUTES);
   }
 
@@ -1038,6 +1077,8 @@ public class OrkaCloudClient extends BuildServerAdapter implements CloudClientEx
           instance.setStatus(InstanceStatus.RUNNING);
           instance.setHost(this.getRealHost(vmResponse.getIP()));
           instance.setPort(vmResponse.getSSH() > 0 ? vmResponse.getSSH() : 22);
+          // Mark agent as connected - recovered instances must have had agent connected previously
+          instance.markAgentConnected();
 
           LOG.info(String.format("[%s] Recovered VM from CloudState: %s (IP: %s, SSH: %d)",
               this.profileId, instanceId, vmResponse.getIP(), instance.getPort()));

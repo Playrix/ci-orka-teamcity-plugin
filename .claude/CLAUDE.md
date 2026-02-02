@@ -135,8 +135,23 @@ cloudState.getStartedInstances(imageId);                    // For recovery
 
 ### Agent Lifecycle Monitoring
 - Agent connection tracked via `containsAgent()` callback from TeamCity
-- Scheduled timeout checks for orphan VM detection
+- Scheduled timeout checks for orphan VM detection (20 minutes)
 - `RemoveFailedInstancesTask` cleans up instances marked for termination
+
+### Agent Connection Timeout Configuration
+The plugin terminates VMs if the TeamCity agent doesn't connect within 20 minutes.
+This can be disabled via `internal.properties`:
+
+```properties
+# File: /data/teamcity_server/datadir/config/internal.properties
+# Disable agent connection timeout (default: true)
+teamcity.cloud.orka.agentConnectionTimeout.enabled=false
+```
+
+**When to disable:**
+- Debugging agent connection issues
+- VMs with slow startup or network delays
+- Temporarily to prevent automatic termination
 
 ## Development Guidelines
 
