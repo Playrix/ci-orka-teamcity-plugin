@@ -126,8 +126,9 @@ public class OrkaCloudClient extends BuildServerAdapter implements CloudClientEx
 
     this.initializeBackgroundTasks();
 
-    // Recover existing VMs from Orka and CloudState (async to not block startup)
-    this.scheduledExecutorService.submit(this::recoverExistingInstances);
+    // Recover existing VMs synchronously to ensure instances are available
+    // before agents reconnect after server restart (fixes race condition)
+    this.recoverExistingInstances();
   }
 
   @Used("Tests")
@@ -162,10 +163,8 @@ public class OrkaCloudClient extends BuildServerAdapter implements CloudClientEx
     this.sshUtil = sshUtil;
     this.nodeMappings = this.getNodeMappings(params.getParameter(OrkaConstants.NODE_MAPPINGS));
 
-    // Trigger instance recovery (same as production constructor)
-    if (this.scheduledExecutorService != null) {
-      this.scheduledExecutorService.submit(this::recoverExistingInstances);
-    }
+    // Trigger instance recovery synchronously (same as production constructor)
+    this.recoverExistingInstances();
   }
 
   private Map<String, String> getNodeMappings(String mappingsData) {
@@ -348,6 +347,8 @@ public class OrkaCloudClient extends BuildServerAdapter implements CloudClientEx
         cloudInstance.setPort(sshPort);
         // Mark agent as connected - this is a recovery from existing agent
         cloudInstance.markAgentConnected();
+        // Register in CloudState for persistence across server restarts
+        this.registerInstanceInCloudState(image.getId(), instanceId);
         return cloudInstance;
       }
     } catch (IOException | NumberFormatException e) {
@@ -1066,7 +1067,7 @@ public class OrkaCloudClient extends BuildServerAdapter implements CloudClientEx
 
           // Verify VM exists in Orka and get its details
           VMResponse vmResponse = this.getVM(instanceId, image.getNamespace());
-          if (!vmResponse.isSuccessful() || vmResponse.getIP() == null) {
+          if (vmResponse == null || !vmResponse.isSuccessful() || vmResponse.getIP() == null) {
             LOG.debug(String.format("[%s] VM %s not found in Orka, skipping",
                 this.profileId, instanceId));
             continue;
@@ -1079,6 +1080,9 @@ public class OrkaCloudClient extends BuildServerAdapter implements CloudClientEx
           instance.setPort(vmResponse.getSSH() > 0 ? vmResponse.getSSH() : 22);
           // Mark agent as connected - recovered instances must have had agent connected previously
           instance.markAgentConnected();
+
+          // Re-register in CloudState to ensure consistency on subsequent restarts
+          this.registerInstanceInCloudState(image.getId(), instanceId);
 
           LOG.info(String.format("[%s] Recovered VM from CloudState: %s (IP: %s, SSH: %d)",
               this.profileId, instanceId, vmResponse.getIP(), instance.getPort()));
@@ -1094,7 +1098,7 @@ public class OrkaCloudClient extends BuildServerAdapter implements CloudClientEx
       }
     } catch (Exception e) {
       LOG.warn(String.format("[%s] Failed to recover instances from CloudState: %s",
-          this.profileId, e.getMessage()));
+          this.profileId, e.getMessage()), e);
     }
   }
 
@@ -1110,6 +1114,11 @@ public class OrkaCloudClient extends BuildServerAdapter implements CloudClientEx
 
     try {
       VMsResponse vmsResponse = this.orkaClient.getVMs(image.getNamespace());
+      if (vmsResponse == null) {
+        LOG.warn(String.format("[%s] Unexpected null response from Orka API for namespace '%s'",
+            this.profileId, image.getNamespace()));
+        return;
+      }
       java.util.List<OrkaVM> vms = vmsResponse.getVMs();
       if (vms == null || vms.isEmpty()) {
         LOG.debug(String.format("[%s] No VMs found in namespace '%s'", this.profileId, image.getNamespace()));
@@ -1151,7 +1160,8 @@ public class OrkaCloudClient extends BuildServerAdapter implements CloudClientEx
         LOG.info(String.format("[%s] Recovered %d existing VM(s) from Orka", this.profileId, recoveredCount));
       }
     } catch (Exception e) {
-      LOG.warn(String.format("[%s] Failed to recover existing VMs from Orka: %s", this.profileId, e.getMessage()));
+      LOG.warn(String.format("[%s] Failed to recover existing VMs from Orka: %s",
+          this.profileId, e.getMessage()), e);
     }
   }
 
@@ -1181,7 +1191,7 @@ public class OrkaCloudClient extends BuildServerAdapter implements CloudClientEx
       if (this.orkaClient != null) {
         try {
           VMResponse vmResponse = this.getVM(data.getInstanceId(), data.getNamespace());
-          if (!vmResponse.isSuccessful()) {
+          if (vmResponse == null || !vmResponse.isSuccessful()) {
             LOG.info(String.format("[%s] VM %s no longer exists in Orka, skipping",
                 this.profileId, data.getInstanceId()));
             continue;

@@ -933,4 +933,125 @@ public class OrkaCloudClientTest {
 
         return scheduledExecutorService;
     }
+
+    // ============ CloudState Registration Tests ============
+
+    public void recoverFromCloudState_registersInstanceInCloudState() throws IOException {
+        String vmConfigName = "testVm";
+        String instanceId = "recovered-vm-123";
+        String vmHost = "192.168.1.100";
+        int vmSshPort = 8022;
+
+        OrkaClient orkaClient = mock(OrkaClient.class);
+        VMResponse vmResponse = new VMResponse(instanceId, vmSshPort, vmHost, null);
+        vmResponse.setHttpResponse(new HttpResponse("success", 200, true));
+        when(orkaClient.getVM(instanceId, "orka-default")).thenReturn(vmResponse);
+
+        VMsResponse vmsResponse = new VMsResponse(Collections.emptyList(), null);
+        vmsResponse.setHttpResponse(new HttpResponse("success", 200, true));
+        when(orkaClient.getVMs(any())).thenReturn(vmsResponse);
+
+        CloudState cloudState = mock(CloudState.class);
+        String fullImageId = Utils.getFullImageId(vmConfigName);
+        when(cloudState.getStartedInstances(fullImageId)).thenReturn(Arrays.asList(instanceId));
+
+        OrkaCloudClient client = new OrkaCloudClient(
+            Utils.getCloudClientParametersMock(vmConfigName),
+            orkaClient, getScheduledExecutorService(),
+            mock(RemoteAgent.class), mock(SSHUtil.class),
+            "test-profile", "Test Profile", cloudState);
+
+        // Verify registerRunningInstance was called during recovery
+        verify(cloudState).registerRunningInstance(fullImageId, instanceId);
+    }
+
+    public void findInstanceByAgent_registersInstanceInCloudState_whenCreatingFromExistingAgent()
+            throws IOException {
+        String vmConfigName = "testVm";
+        String instanceId = "agent-vm-123";
+        String vmHost = "192.168.1.100";
+        int vmSshPort = 8022;
+        String fullImageId = Utils.getFullImageId(vmConfigName);
+
+        OrkaClient orkaClient = mock(OrkaClient.class);
+        // Mock getVM for createInstanceFromExistingAgent
+        VMResponse vmResponse = new VMResponse(instanceId, vmSshPort, vmHost, null);
+        vmResponse.setHttpResponse(new HttpResponse("success", 200, true));
+        when(orkaClient.getVM(instanceId, "orka-default")).thenReturn(vmResponse);
+
+        // Empty recovery - no instances in CloudState or Orka
+        VMsResponse vmsResponse = new VMsResponse(Collections.emptyList(), null);
+        vmsResponse.setHttpResponse(new HttpResponse("success", 200, true));
+        when(orkaClient.getVMs(any())).thenReturn(vmsResponse);
+
+        CloudState cloudState = mock(CloudState.class);
+        when(cloudState.getStartedInstances(fullImageId)).thenReturn(Collections.emptyList());
+
+        OrkaCloudClient client = new OrkaCloudClient(
+            Utils.getCloudClientParametersMock(vmConfigName),
+            orkaClient, getScheduledExecutorService(),
+            mock(RemoteAgent.class), mock(SSHUtil.class),
+            "test-profile", "Test Profile", cloudState);
+
+        // Agent connects - should trigger createInstanceFromExistingAgent
+        AgentDescription agentDescription = getAgentDescriptionMock(instanceId, fullImageId);
+        OrkaCloudInstance instance = client.findInstanceByAgent(agentDescription);
+
+        assertNotNull("Instance should be created from existing agent", instance);
+        // Verify registerRunningInstance was called
+        verify(cloudState).registerRunningInstance(fullImageId, instanceId);
+    }
+
+    public void recoverFromCloudState_handlesNullVmResponse() throws IOException {
+        String vmConfigName = "testVm";
+        String instanceId = "vm-with-null-response";
+
+        OrkaClient orkaClient = mock(OrkaClient.class);
+        // Mock getVM to return null (simulating API failure)
+        when(orkaClient.getVM(instanceId, "orka-default")).thenReturn(null);
+
+        VMsResponse vmsResponse = new VMsResponse(Collections.emptyList(), null);
+        vmsResponse.setHttpResponse(new HttpResponse("success", 200, true));
+        when(orkaClient.getVMs(any())).thenReturn(vmsResponse);
+
+        CloudState cloudState = mock(CloudState.class);
+        String fullImageId = Utils.getFullImageId(vmConfigName);
+        when(cloudState.getStartedInstances(fullImageId)).thenReturn(Arrays.asList(instanceId));
+
+        // Should not throw NPE
+        OrkaCloudClient client = new OrkaCloudClient(
+            Utils.getCloudClientParametersMock(vmConfigName),
+            orkaClient, getScheduledExecutorService(),
+            mock(RemoteAgent.class), mock(SSHUtil.class),
+            "test-profile", "Test Profile", cloudState);
+
+        OrkaCloudImage image = client.findImageById(fullImageId);
+        assertNotNull("Image should be found", image);
+        // Instance should NOT be recovered (null response)
+        assertNull("Instance should not be recovered with null VM response",
+            image.findInstanceById(instanceId));
+    }
+
+    public void recoverFromOrka_handlesNullVmsResponse() throws IOException {
+        String vmConfigName = "testVm";
+
+        OrkaClient orkaClient = mock(OrkaClient.class);
+        // Mock getVMs to return null
+        when(orkaClient.getVMs(any())).thenReturn(null);
+
+        CloudState cloudState = mock(CloudState.class);
+        String fullImageId = Utils.getFullImageId(vmConfigName);
+        when(cloudState.getStartedInstances(fullImageId)).thenReturn(Collections.emptyList());
+
+        // Should not throw NPE
+        OrkaCloudClient client = new OrkaCloudClient(
+            Utils.getCloudClientParametersMock(vmConfigName),
+            orkaClient, getScheduledExecutorService(),
+            mock(RemoteAgent.class), mock(SSHUtil.class),
+            "test-profile", "Test Profile", cloudState);
+
+        OrkaCloudImage image = client.findImageById(fullImageId);
+        assertNotNull("Image should be found", image);
+        assertTrue("No instances should be recovered", image.getInstances().isEmpty());
+    }
 }
