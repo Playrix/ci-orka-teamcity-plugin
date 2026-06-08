@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.1.0-ci] - 2026-06-08
+
+First semantically versioned release of the fork (previously built as
+`SNAPSHOT-<timestamp>`). Versioned above the upstream `2.0.1` so TeamCity
+recognizes it as newer.
+
 ### Fixed
 
 - **Orphaned VMs after failed deployments.** When a VM deployment failed during
@@ -32,3 +38,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     (default: `true`).
   - `teamcity.cloud.orka.orphanCleanup.intervalMinutes` — scan interval in
     minutes (default: `15`).
+
+[Unreleased]: https://github.com/Playrix/ci-orka-teamcity-plugin/compare/v3.1.0-ci...HEAD
+[3.1.0-ci]: https://github.com/Playrix/ci-orka-teamcity-plugin/releases/tag/v3.1.0-ci
