@@ -186,7 +186,7 @@ public class OrkaCloudClientTest {
     assertEquals(0, this.getImage(client).getInstances().size());
   }
 
-  public void when_start_new_instance_with_failing_deploy_should_terminate_instance()
+  public void when_start_new_instance_with_failing_deploy_should_mark_instance_for_cleanup()
       throws IOException, InterruptedException {
     String vmConfigName = "imageId";
     String instanceId = "instanceId";
@@ -194,14 +194,92 @@ public class OrkaCloudClientTest {
     int sshPort = 8822;
 
     OrkaClient orkaClient = this.getOrkaClientMock(host, sshPort, instanceId);
+    // Network failure during deploy: the VM may have been created on the Orka side even though we got
+    // no successful response, so the instance must be kept and marked for verify-and-delete cleanup.
     when(orkaClient.deployVM(any(), any(), any())).thenThrow(new IOException("Error"));
     when(orkaClient.deployVM(any(), any(), any(), any())).thenThrow(new IOException("Error"));
+    OrkaCloudClient client = new OrkaCloudClient(Utils.getCloudClientParametersMock(vmConfigName), orkaClient,
+        this.getScheduledExecutorService(), mock(RemoteAgent.class), mock(SSHUtil.class));
+
+    OrkaCloudInstance instance = (OrkaCloudInstance) client.startNewInstance(this.getImage(client), null);
+
+    assertEquals(1, this.getImage(client).getInstances().size());
+    assertTrue("Instance marked for termination", instance.isMarkedForTermination());
+    assertEquals(InstanceStatus.ERROR, instance.getStatus());
+  }
+
+  public void when_start_new_instance_with_capacity_rejection_should_drop_tracking()
+      throws IOException, InterruptedException {
+    String vmConfigName = "imageId";
+    String instanceId = "instanceId";
+    String host = "10.10.10.1";
+    int sshPort = 8822;
+
+    OrkaClient orkaClient = this.getOrkaClientMock(host, sshPort, instanceId);
+    // Orka explicitly rejects due to quota: no VM was created, so tracking is simply dropped.
+    DeploymentResponse rejected = new DeploymentResponse(null, 0, null,
+        "Cannot deploy more than the allowed number of VMs");
+    rejected.setHttpResponse(new HttpResponse("imageId", 400, false));
+    when(orkaClient.deployVM(any(), any(), any())).thenReturn(rejected);
+    when(orkaClient.deployVM(any(), any(), any(), any())).thenReturn(rejected);
     OrkaCloudClient client = new OrkaCloudClient(Utils.getCloudClientParametersMock(vmConfigName), orkaClient,
         this.getScheduledExecutorService(), mock(RemoteAgent.class), mock(SSHUtil.class));
 
     client.startNewInstance(this.getImage(client), null);
 
     assertEquals(0, this.getImage(client).getInstances().size());
+  }
+
+  public void cleanupOrphanedVms_deletes_untracked_profile_vm() throws IOException {
+    String vmConfigName = "imageId";
+    OrkaClient orkaClient = mock(OrkaClient.class);
+    // Empty VM list during construction so nothing is recovered as a tracked instance.
+    VMsResponse empty = new VMsResponse(Collections.emptyList(), null);
+    empty.setHttpResponse(new HttpResponse("vms", 200, true));
+    when(orkaClient.getVMs(any())).thenReturn(empty);
+
+    OrkaCloudClient client = new OrkaCloudClient(Utils.getCloudClientParametersMock(vmConfigName), orkaClient,
+        this.getScheduledExecutorService(), mock(RemoteAgent.class), mock(SSHUtil.class));
+
+    // An orphaned VM tagged for this profile appears in Orka but is not tracked by the plugin.
+    OrkaVM orphan = new com.google.gson.Gson().fromJson(
+        "{\"name\":\"orphan-vm\",\"status\":\"Running\",\"customMetadata\":{\"tc_profile_id\":\"test-profile\"}}",
+        OrkaVM.class);
+    VMsResponse withOrphan = new VMsResponse(Arrays.asList(orphan), null);
+    withOrphan.setHttpResponse(new HttpResponse("vms", 200, true));
+    when(orkaClient.getVMs(any())).thenReturn(withOrphan);
+
+    DeletionResponse deletion = new DeletionResponse("Success");
+    deletion.setHttpResponse(new HttpResponse("orphan-vm", 200, true));
+    when(orkaClient.deleteVM(any(), any())).thenReturn(deletion);
+
+    client.cleanupOrphanedVms();
+
+    verify(orkaClient).deleteVM("orphan-vm", "orka-default");
+  }
+
+  public void cleanupOrphanedVms_skips_vm_from_other_profile() throws IOException {
+    String vmConfigName = "imageId";
+    OrkaClient orkaClient = mock(OrkaClient.class);
+    VMsResponse empty = new VMsResponse(Collections.emptyList(), null);
+    empty.setHttpResponse(new HttpResponse("vms", 200, true));
+    when(orkaClient.getVMs(any())).thenReturn(empty);
+
+    OrkaCloudClient client = new OrkaCloudClient(Utils.getCloudClientParametersMock(vmConfigName), orkaClient,
+        this.getScheduledExecutorService(), mock(RemoteAgent.class), mock(SSHUtil.class));
+
+    // VM belongs to a different profile - must never be touched.
+    OrkaVM otherProfileVm = new com.google.gson.Gson().fromJson(
+        "{\"name\":\"other-vm\",\"status\":\"Running\",\"customMetadata\":{\"tc_profile_id\":\"other-profile\"}}",
+        OrkaVM.class);
+    OrkaVM noMetadataVm = new OrkaVM("no-meta-vm", "node", "Running", "arm64");
+    VMsResponse vms = new VMsResponse(Arrays.asList(otherProfileVm, noMetadataVm), null);
+    vms.setHttpResponse(new HttpResponse("vms", 200, true));
+    when(orkaClient.getVMs(any())).thenReturn(vms);
+
+    client.cleanupOrphanedVms();
+
+    verify(orkaClient, org.mockito.Mockito.never()).deleteVM(anyString(), anyString());
   }
 
   public void when_terminate_instance_should_return_remove_instance() throws IOException {

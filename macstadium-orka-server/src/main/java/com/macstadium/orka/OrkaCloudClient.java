@@ -24,7 +24,9 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
@@ -66,6 +68,13 @@ public class OrkaCloudClient extends BuildServerAdapter implements CloudClientEx
   // Set teamcity.cloud.orka.agentConnectionTimeout.enabled=false in internal.properties to disable
   private static final String AGENT_TIMEOUT_ENABLED_PROPERTY = "teamcity.cloud.orka.agentConnectionTimeout.enabled";
 
+  // Periodic orphan VM cleanup - deletes Orka VMs tagged for this profile that the plugin no longer tracks.
+  // Guards against VMs leaked when deployment fails after the VM was already created (e.g. HTTP 504 / network errors).
+  private static final String ORPHAN_CLEANUP_ENABLED_PROPERTY = "teamcity.cloud.orka.orphanCleanup.enabled";
+  private static final String ORPHAN_CLEANUP_INTERVAL_PROPERTY = "teamcity.cloud.orka.orphanCleanup.intervalMinutes";
+  private static final long ORPHAN_CLEANUP_DEFAULT_INTERVAL_MINUTES = 15;
+  private static final long ORPHAN_CLEANUP_INITIAL_DELAY_MINUTES = 5;
+
   // Pattern to extract profile name from description: "profile 'NAME'{id=ID}"
   private static final Pattern PROFILE_NAME_PATTERN = Pattern.compile("profile\\s+'([^']+)'");
 
@@ -80,6 +89,7 @@ public class OrkaCloudClient extends BuildServerAdapter implements CloudClientEx
   private final ScheduledExecutorService scheduledExecutorService;
   private ScheduledFuture<?> removedFailedInstancesScheduledTask;
   private ScheduledFuture<?> gracefulShutdownScheduledTask;
+  private ScheduledFuture<?> orphanCleanupScheduledTask;
   private CloudErrorInfo errorInfo;
   private final RemoteAgent remoteAgent;
   private final SSHUtil sshUtil;
@@ -90,6 +100,10 @@ public class OrkaCloudClient extends BuildServerAdapter implements CloudClientEx
 
   // Lock for serializing capacity check + deployment to prevent race conditions
   private final Object deploymentLock = new Object();
+
+  // Names of VMs currently being deployed (from the deploy request until the instance is tracked by its
+  // real Orka name). The orphan cleanup task uses this to avoid deleting VMs that are still mid-deployment.
+  private final Set<String> pendingDeploymentVmNames = ConcurrentHashMap.newKeySet();
 
   // CloudState for persistence across profile reloads and server restarts
   @Nullable
@@ -229,6 +243,16 @@ public class OrkaCloudClient extends BuildServerAdapter implements CloudClientEx
     int gracefulDelay = 60 * 1000; // Check every minute
     this.gracefulShutdownScheduledTask = this.scheduledExecutorService
         .scheduleWithFixedDelay(gracefulShutdownTask, gracefulInitialDelay, gracefulDelay, TimeUnit.MILLISECONDS);
+
+    // Task to reap orphaned VMs that the plugin lost track of (e.g. after deployment failures).
+    long orphanIntervalMinutes = TeamCityProperties.getLong(
+        ORPHAN_CLEANUP_INTERVAL_PROPERTY, ORPHAN_CLEANUP_DEFAULT_INTERVAL_MINUTES);
+    if (orphanIntervalMinutes <= 0) {
+      orphanIntervalMinutes = ORPHAN_CLEANUP_DEFAULT_INTERVAL_MINUTES;
+    }
+    OrphanedVmCleanupTask orphanedVmCleanupTask = new OrphanedVmCleanupTask(this);
+    this.orphanCleanupScheduledTask = this.scheduledExecutorService.scheduleWithFixedDelay(
+        orphanedVmCleanupTask, ORPHAN_CLEANUP_INITIAL_DELAY_MINUTES, orphanIntervalMinutes, TimeUnit.MINUTES);
   }
 
   private OrkaCloudImage createImage(CloudClientParameters params) {
@@ -486,139 +510,199 @@ public class OrkaCloudClient extends BuildServerAdapter implements CloudClientEx
     DeploymentResponse response;
     String deployedInstanceId;
 
-    // Synchronized block to prevent race conditions:
-    // Multiple threads checking capacity simultaneously would all see "1 slot
-    // available"
-    // and try to deploy, causing Orka errors. Lock ensures sequential
-    // check+deploy+result.
-    synchronized (this.deploymentLock) {
-      try {
-        // Check capacity before deployment
-        CapacityInfo capacityInfo = this.checkCapacity(image.getVmConfigName(), image.getNamespace());
-        this.updateCapacityCache(capacityInfo);
-
-        if (!capacityInfo.hasCapacity()) {
-          LOG.warn(String.format("[%s] No capacity for '%s' (backoff %.0fs): %s",
-              this.profileId, image.getVmConfigName(),
-              CAPACITY_FAILURE_BACKOFF_MS / 1000.0, capacityInfo.getMessage()));
-          instance.setStatus(InstanceStatus.ERROR);
-          instance.setErrorInfo(new CloudErrorInfo("No capacity available", capacityInfo.getMessage()));
-          image.terminateInstance(instance.getInstanceId());
-          return;
-        }
-
-        LOG.info(String.format("[%s] Capacity OK for '%s': %s",
-            this.profileId, image.getVmConfigName(), capacityInfo.getMessage()));
-
-        String vmMetadata = image.getVmMetadata();
-        if (StringUtil.isNotEmpty(vmMetadata) && !isValidMetadataFormat(vmMetadata)) {
-          LOG.warn(String.format("[%s] Invalid VM metadata format: %s. Expected: key1=value1,key2=value2",
-              this.profileId, vmMetadata));
-          vmMetadata = null;
-        }
-
-        // Add TeamCity tracking metadata for recovery after profile reload
-        vmMetadata = addTeamCityMetadata(vmMetadata, image.getId());
-
-        // Generate custom VM name based on project metadata
-        String vmName = generateVmName(vmMetadata);
-
-        LOG.info(String.format("[%s] Deploying VM: name=%s, config=%s",
-            this.profileId, vmName, image.getVmConfigName()));
-        response = this.deployVM(vmName, image.getVmConfigName(), image.getNamespace(), vmMetadata);
-
-        // Check deployment result INSIDE synchronized block to set backoff before other
-        // threads can proceed
-        if (!response.isSuccessful()) {
-          String errorMsg = response.getMessage();
-          LOG.warn(String.format("[%s] VM deployment failed: %s", this.profileId, errorMsg));
-
-          // If deployment failed due to capacity issue, set backoff immediately
-          if (errorMsg != null && errorMsg.contains("Cannot deploy more than")) {
-            CapacityInfo failedCapacity = CapacityInfo.noCapacity(
-                String.format("Deployment failed: %s", errorMsg));
-            this.updateCapacityCache(failedCapacity);
-            LOG.warn(String.format("[%s] Setting capacity backoff (%.0fs) due to deployment failure",
-                this.profileId, CAPACITY_FAILURE_BACKOFF_MS / 1000.0));
-          }
-
-          instance.setStatus(InstanceStatus.ERROR);
-          instance.setErrorInfo(new CloudErrorInfo("Deployment failed", errorMsg));
-          image.terminateInstance(instance.getInstanceId());
-          return;
-        }
-
-        deployedInstanceId = response.getName();
-        LOG.info(String.format("[%s] VM deployed: %s (IP: %s, SSH port: %d)",
-            this.profileId, deployedInstanceId, response.getIP(), response.getSSH()));
-
-        // Invalidate cache after successful deployment (resources changed)
-        this.invalidateCapacityCache();
-
-      } catch (Exception e) {
-        LOG.warn(String.format("[%s] Error during capacity check/deployment: %s", this.profileId, e.getMessage()));
-        instance.setStatus(InstanceStatus.ERROR);
-        instance.setErrorInfo(new CloudErrorInfo("Deployment error", e.getMessage()));
-        image.terminateInstance(instance.getInstanceId());
-        return;
-      }
-    } // End synchronized - release lock after deployment result processed
+    // Name of the VM we send to Orka. Generated before the deploy request, so it is known even if the
+    // request fails (e.g. HTTP 504 / network error) - which lets us clean up a VM that may have been
+    // created on the Orka side even though we never got a successful response.
+    String vmName = null;
 
     try {
-      // Verify VM exists in Orka
-      VMResponse vmStatus = this.getVM(deployedInstanceId, image.getNamespace());
-      if (!vmStatus.isSuccessful()) {
-        LOG.warn(String.format("[%s] VM %s not found in Orka after deployment: %s",
-            this.profileId, deployedInstanceId, vmStatus.getMessage()));
-        image.terminateInstance(instance.getInstanceId());
-        return;
+      // Synchronized block to prevent race conditions:
+      // Multiple threads checking capacity simultaneously would all see "1 slot
+      // available"
+      // and try to deploy, causing Orka errors. Lock ensures sequential
+      // check+deploy+result.
+      synchronized (this.deploymentLock) {
+        try {
+          // Check capacity before deployment
+          CapacityInfo capacityInfo = this.checkCapacity(image.getVmConfigName(), image.getNamespace());
+          this.updateCapacityCache(capacityInfo);
+
+          if (!capacityInfo.hasCapacity()) {
+            LOG.warn(String.format("[%s] No capacity for '%s' (backoff %.0fs): %s",
+                this.profileId, image.getVmConfigName(),
+                CAPACITY_FAILURE_BACKOFF_MS / 1000.0, capacityInfo.getMessage()));
+            instance.setStatus(InstanceStatus.ERROR);
+            instance.setErrorInfo(new CloudErrorInfo("No capacity available", capacityInfo.getMessage()));
+            // No VM was deployed yet, so nothing to clean up - just drop tracking.
+            image.terminateInstance(instance.getInstanceId());
+            return;
+          }
+
+          LOG.info(String.format("[%s] Capacity OK for '%s': %s",
+              this.profileId, image.getVmConfigName(), capacityInfo.getMessage()));
+
+          String vmMetadata = image.getVmMetadata();
+          if (StringUtil.isNotEmpty(vmMetadata) && !isValidMetadataFormat(vmMetadata)) {
+            LOG.warn(String.format("[%s] Invalid VM metadata format: %s. Expected: key1=value1,key2=value2",
+                this.profileId, vmMetadata));
+            vmMetadata = null;
+          }
+
+          // Add TeamCity tracking metadata for recovery after profile reload
+          vmMetadata = addTeamCityMetadata(vmMetadata, image.getId());
+
+          // Generate custom VM name based on project metadata
+          vmName = generateVmName(vmMetadata);
+          // Mark as in-flight so the orphan cleanup task won't delete it while we are still deploying.
+          this.pendingDeploymentVmNames.add(vmName);
+
+          LOG.info(String.format("[%s] Deploying VM: name=%s, config=%s",
+              this.profileId, vmName, image.getVmConfigName()));
+          response = this.deployVM(vmName, image.getVmConfigName(), image.getNamespace(), vmMetadata);
+
+          // Check deployment result INSIDE synchronized block to set backoff before other
+          // threads can proceed
+          if (!response.isSuccessful()) {
+            String errorMsg = response.getMessage();
+            LOG.warn(String.format("[%s] VM deployment failed: %s", this.profileId, errorMsg));
+
+            // If deployment failed due to capacity issue, set backoff immediately
+            if (errorMsg != null && errorMsg.contains("Cannot deploy more than")) {
+              CapacityInfo failedCapacity = CapacityInfo.noCapacity(
+                  String.format("Deployment failed: %s", errorMsg));
+              this.updateCapacityCache(failedCapacity);
+              LOG.warn(String.format("[%s] Setting capacity backoff (%.0fs) due to deployment failure",
+                  this.profileId, CAPACITY_FAILURE_BACKOFF_MS / 1000.0));
+
+              // Orka explicitly rejected the request due to quota - the VM was NOT created, drop tracking.
+              instance.setStatus(InstanceStatus.ERROR);
+              instance.setErrorInfo(new CloudErrorInfo("Deployment failed", errorMsg));
+              image.terminateInstance(instance.getInstanceId());
+              return;
+            }
+
+            // Any other error (HTTP 504, gateway/proxy errors, malformed response, ...) is ambiguous:
+            // the request may have reached Orka and created the VM. Keep tracking the instance under the
+            // real Orka name and let the cleanup task verify-and-delete it, instead of leaking an orphan.
+            this.markOrphanedVmForCleanup(image, instance, vmName,
+                new CloudErrorInfo("Deployment failed", errorMsg));
+            return;
+          }
+
+          deployedInstanceId = response.getName();
+          LOG.info(String.format("[%s] VM deployed: %s (IP: %s, SSH port: %d)",
+              this.profileId, deployedInstanceId, response.getIP(), response.getSSH()));
+
+          // Invalidate cache after successful deployment (resources changed)
+          this.invalidateCapacityCache();
+
+        } catch (Exception e) {
+          LOG.warn(String.format("[%s] Error during capacity check/deployment: %s", this.profileId, e.getMessage()));
+          if (vmName != null) {
+            // The deploy request was sent before the exception (e.g. socket timeout after Orka processed
+            // it). The VM may exist - mark for verify-and-delete instead of forgetting about it.
+            this.markOrphanedVmForCleanup(image, instance, vmName,
+                new CloudErrorInfo("Deployment error", e.getMessage()));
+          } else {
+            // Failure happened before the deploy request (e.g. capacity check) - no VM was created.
+            instance.setStatus(InstanceStatus.ERROR);
+            instance.setErrorInfo(new CloudErrorInfo("Deployment error", e.getMessage()));
+            image.terminateInstance(instance.getInstanceId());
+          }
+          return;
+        }
+      } // End synchronized - release lock after deployment result processed
+
+      try {
+        // Verify VM exists in Orka
+        VMResponse vmStatus = this.getVM(deployedInstanceId, image.getNamespace());
+        if (!vmStatus.isSuccessful()) {
+          LOG.warn(String.format("[%s] VM %s not found in Orka after deployment: %s",
+              this.profileId, deployedInstanceId, vmStatus.getMessage()));
+          // Deploy reported success but the VM is not visible. This is ambiguous (transient read error
+          // or the VM really is gone) - mark for verify-and-delete so we never leak it.
+          this.markOrphanedVmForCleanup(image, instance, deployedInstanceId,
+              new CloudErrorInfo("VM not found after deployment", vmStatus.getMessage()));
+          return;
+        }
+
+        String host = this.getRealHost(response.getIP());
+        int sshPort = response.getSSH();
+
+        if (sshPort == 0) {
+          LOG.debug(String.format("[%s] SSH port is 0, using default port 22 for VM %s",
+              this.profileId, deployedInstanceId));
+          sshPort = 22;
+        }
+
+        instance.setStatus(InstanceStatus.STARTING);
+        instance.setInstanceId(deployedInstanceId);
+        instance.setHost(host);
+        instance.setPort(sshPort);
+
+        LOG.debug(String.format("[%s] Waiting for SSH on %s:%d...", this.profileId, host, sshPort));
+        this.waitForVM(host, sshPort);
+
+        LOG.debug(String.format("[%s] Configuring agent on VM %s (user: %s, agentDir: %s)",
+            this.profileId, deployedInstanceId, image.getUser(), this.agentDirectory));
+
+        // Update buildAgent.properties ONCE, then start agent ONCE
+        this.updateBuildAgentPropertiesOnce(host, sshPort, image.getUser(), image.getPassword(),
+            deployedInstanceId, image.getNamespace());
+
+        // Start agent without retry - if it fails, entire VM setup fails
+        this.remoteAgent.startAgent(deployedInstanceId, image.getId(), host, sshPort, image.getUser(),
+            image.getPassword(), this.agentDirectory, data);
+
+        instance.setStatus(InstanceStatus.RUNNING);
+        LOG.info(String.format("[%s] VM %s setup completed", this.profileId, deployedInstanceId));
+
+        // Register instance in CloudState for persistence across server restarts
+        this.registerInstanceInCloudState(image.getId(), deployedInstanceId);
+
+        // Schedule check to verify agent connects to TeamCity
+        this.scheduleAgentConnectionCheck(instance);
+      } catch (IOException | InterruptedException e) {
+        LOG.warnAndDebugDetails(String.format("[%s] VM setup failed for %s",
+            this.profileId, instance.getInstanceId()), e);
+        instance.setStatus(InstanceStatus.ERROR);
+        instance.setErrorInfo(new CloudErrorInfo(e.getMessage(), e.toString(), e));
+
+        LOG.warn(String.format("[%s] Terminating failed VM %s", this.profileId, instance.getInstanceId()));
+        this.terminateNonInitilizedInstance(instance);
       }
-
-      String host = this.getRealHost(response.getIP());
-      int sshPort = response.getSSH();
-
-      if (sshPort == 0) {
-        LOG.debug(String.format("[%s] SSH port is 0, using default port 22 for VM %s",
-            this.profileId, deployedInstanceId));
-        sshPort = 22;
+    } finally {
+      // Once we leave setUpVM the instance is tracked under its real Orka name (either RUNNING after a
+      // successful setup, or marked for cleanup on failure), so the orphan task can safely manage it.
+      if (vmName != null) {
+        this.pendingDeploymentVmNames.remove(vmName);
       }
-
-      instance.setStatus(InstanceStatus.STARTING);
-      instance.setInstanceId(deployedInstanceId);
-      instance.setHost(host);
-      instance.setPort(sshPort);
-
-      LOG.debug(String.format("[%s] Waiting for SSH on %s:%d...", this.profileId, host, sshPort));
-      this.waitForVM(host, sshPort);
-
-      LOG.debug(String.format("[%s] Configuring agent on VM %s (user: %s, agentDir: %s)",
-          this.profileId, deployedInstanceId, image.getUser(), this.agentDirectory));
-
-      // Update buildAgent.properties ONCE, then start agent ONCE
-      this.updateBuildAgentPropertiesOnce(host, sshPort, image.getUser(), image.getPassword(),
-          deployedInstanceId, image.getNamespace());
-
-      // Start agent without retry - if it fails, entire VM setup fails
-      this.remoteAgent.startAgent(deployedInstanceId, image.getId(), host, sshPort, image.getUser(),
-          image.getPassword(), this.agentDirectory, data);
-
-      instance.setStatus(InstanceStatus.RUNNING);
-      LOG.info(String.format("[%s] VM %s setup completed", this.profileId, deployedInstanceId));
-
-      // Register instance in CloudState for persistence across server restarts
-      this.registerInstanceInCloudState(image.getId(), deployedInstanceId);
-
-      // Schedule check to verify agent connects to TeamCity
-      this.scheduleAgentConnectionCheck(instance);
-    } catch (IOException | InterruptedException e) {
-      LOG.warnAndDebugDetails(String.format("[%s] VM setup failed for %s",
-          this.profileId, instance.getInstanceId()), e);
-      instance.setStatus(InstanceStatus.ERROR);
-      instance.setErrorInfo(new CloudErrorInfo(e.getMessage(), e.toString(), e));
-
-      LOG.warn(String.format("[%s] Terminating failed VM %s", this.profileId, instance.getInstanceId()));
-      this.terminateNonInitilizedInstance(instance);
     }
+  }
+
+  /**
+   * Keeps an instance tracked under its real Orka VM name and marks it for termination after a
+   * deployment failure where the VM may have actually been created (ambiguous errors such as HTTP 504
+   * or network exceptions). {@link RemoveFailedInstancesTask} then verifies the VM via the Orka API and
+   * deletes it if it exists, preventing orphaned VMs whose auto-started agents would otherwise hang in
+   * the "Unauthorized" state.
+   */
+  private void markOrphanedVmForCleanup(OrkaCloudImage image, OrkaCloudInstance instance,
+      String orkaVmName, CloudErrorInfo errorInfo) {
+    instance.setStatus(InstanceStatus.ERROR);
+    instance.setErrorInfo(errorInfo);
+
+    // Re-key the instance from its temporary UUID to the real Orka VM name so that getVM/deleteVM target
+    // the correct VM during cleanup.
+    if (StringUtil.isNotEmpty(orkaVmName) && !orkaVmName.equals(instance.getInstanceId())) {
+      instance.setInstanceId(orkaVmName);
+    }
+    instance.setMarkedForTermination(true);
+
+    LOG.warn(String.format(
+        "[%s] Deployment of VM '%s' did not complete cleanly; marked for orphan cleanup "
+            + "(will verify via Orka API and delete if it exists)",
+        this.profileId, instance.getInstanceId()));
   }
 
   private void terminateNonInitilizedInstance(@NotNull final OrkaCloudInstance instance) {
@@ -902,6 +986,9 @@ public class OrkaCloudClient extends BuildServerAdapter implements CloudClientEx
     }
     if (this.gracefulShutdownScheduledTask != null) {
       this.gracefulShutdownScheduledTask.cancel(false);
+    }
+    if (this.orphanCleanupScheduledTask != null) {
+      this.orphanCleanupScheduledTask.cancel(false);
     }
 
     // Create defensive copy to avoid ConcurrentModificationException
@@ -1303,6 +1390,88 @@ public class OrkaCloudClient extends BuildServerAdapter implements CloudClientEx
     if (recoveredLegacy > 0) {
       LOG.info(String.format("[%s] Recovered %d instance(s) as legacy for graceful shutdown (config changed)",
           this.profileId, recoveredLegacy));
+    }
+  }
+
+  /**
+   * Periodically deletes orphaned Orka VMs that belong to this profile (matched via the
+   * {@code tc_profile_id} metadata) but are no longer tracked by the plugin and are not currently being
+   * deployed. This is the safety net for VMs leaked when deployment bookkeeping is lost entirely (e.g.
+   * the setup thread dies, or a VM was created on Orka but never tracked). Such VMs auto-start an agent
+   * that hangs in the "Unauthorized" state, so they must be reaped.
+   *
+   * Invoked by {@link OrphanedVmCleanupTask}.
+   */
+  void cleanupOrphanedVms() {
+    if (!TeamCityProperties.getBooleanOrTrue(ORPHAN_CLEANUP_ENABLED_PROPERTY)) {
+      return;
+    }
+    if (this.orkaClient == null) {
+      return;
+    }
+
+    LOG.debug(String.format("[%s] Running orphaned VM cleanup...", this.profileId));
+    for (OrkaCloudImage image : this.images) {
+      this.cleanupOrphanedVmsForImage(image);
+    }
+  }
+
+  private void cleanupOrphanedVmsForImage(OrkaCloudImage image) {
+    try {
+      VMsResponse vmsResponse = this.orkaClient.getVMs(image.getNamespace());
+      if (vmsResponse == null || !vmsResponse.isSuccessful()) {
+        LOG.debug(String.format("[%s] Orphan cleanup skipped: could not list VMs in namespace '%s'",
+            this.profileId, image.getNamespace()));
+        return;
+      }
+
+      List<OrkaVM> vms = vmsResponse.getVMs();
+      if (vms == null || vms.isEmpty()) {
+        return;
+      }
+
+      for (OrkaVM vm : vms) {
+        String vmName = vm.getName();
+        if (StringUtil.isEmpty(vmName)) {
+          continue;
+        }
+
+        // Only ever touch VMs that this profile created.
+        if (!vmBelongsToThisProfile(vm)) {
+          continue;
+        }
+
+        // Still being deployed - hands off, setUpVM owns it.
+        if (this.pendingDeploymentVmNames.contains(vmName)) {
+          continue;
+        }
+
+        // Tracked by the plugin (regular or legacy instance) - managed through the normal lifecycle.
+        if (image.findInstanceById(vmName) != null) {
+          continue;
+        }
+
+        // Orphan: belongs to this profile, not pending, not tracked. Reap it.
+        LOG.warn(String.format("[%s] Found orphaned VM '%s' (not tracked by plugin), deleting",
+            this.profileId, vmName));
+        try {
+          DeletionResponse deletion = this.orkaClient.deleteVM(vmName, image.getNamespace());
+          if (deletion != null && deletion.isSuccessful()) {
+            LOG.info(String.format("[%s] Deleted orphaned VM '%s'", this.profileId, vmName));
+            this.clearCapacityBackoff();
+            this.unregisterInstanceFromCloudState(image.getId(), vmName);
+          } else {
+            LOG.warn(String.format("[%s] Failed to delete orphaned VM '%s': %s", this.profileId, vmName,
+                deletion == null ? "null response" : deletion.getMessage()));
+          }
+        } catch (IOException e) {
+          LOG.warn(String.format("[%s] Failed to delete orphaned VM '%s': %s",
+              this.profileId, vmName, e.getMessage()));
+        }
+      }
+    } catch (Exception e) {
+      LOG.warn(String.format("[%s] Orphaned VM cleanup failed for namespace '%s': %s",
+          this.profileId, image.getNamespace(), e.getMessage()), e);
     }
   }
 
